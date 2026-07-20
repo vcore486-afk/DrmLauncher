@@ -33,6 +33,7 @@
 #include <commctrl.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wininet.h>
 #include <libssh2.h>
 
 #include <string>
@@ -43,6 +44,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "wininet.lib")
 
 // ---------------------------------------------------------------------------
 // Константы подключения (заданы по условию задачи)
@@ -51,6 +53,13 @@ static const char* SSH_HOST = "192.168.8.45";
 static const char* SSH_USER = "pi";
 static const char* SSH_PASS = "639639";
 static const int   SSH_PORT = 22;
+
+// Kodi JSON-RPC (HTTP), как в KodiGui (MainWindow::sendJsonRpc /
+// MainWindow::postSetVolume, ветка tab_match_vers2) — тот же хост,
+// отдельный порт веб-интерфейса Kodi.
+static const char* KODI_JSONRPC_HOST = "192.168.8.45";
+static const int   KODI_JSONRPC_PORT = 8081;
+static const char* KODI_JSONRPC_PATH = "/jsonrpc";
 
 // ---------------------------------------------------------------------------
 // Идентификаторы элементов управления
@@ -62,13 +71,16 @@ enum ControlId {
     ID_BUTTON_KILL,        // "Остановить" — killall -9 N_m3u8DL-RE на сервере
     ID_EDIT_LOG,
     ID_STATIC_ARG1,
-    ID_STATIC_ARG2
+    ID_STATIC_ARG2,
+    ID_SLIDER_VOLUME,      // ползунок громкости (Kodi Application.SetVolume)
+    ID_STATIC_VOLUME
 };
 
 // ---------------------------------------------------------------------------
 // Глобальные хендлы
 // ---------------------------------------------------------------------------
 HWND g_hArg1, g_hArg2, g_hLog, g_hRunBtn, g_hKillBtn;
+HWND g_hVolSlider, g_hVolLabel;
 std::atomic<bool> g_running{false};
 std::mutex g_logMutex;
 
@@ -135,6 +147,59 @@ std::string ShellQuote(const std::string& s) {
 // Общее ядро для любой команды на сервере — используется и кнопкой "Выполнить",
 // и кнопкой "Остановить" (killall), чтобы не дублировать connect/auth/read-цикл.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Set Kodi volume (Application.SetVolume) via HTTP JSON-RPC.
+// Same call as KodiGui's MainWindow::sendJsonRpc / postSetVolume
+// (branch tab_match_vers2), but done with WinINet instead of Qt's
+// QNetworkAccessManager, since this app has no Qt. Kodi's web server
+// with JSON-RPC must be enabled in Kodi settings.
+// ---------------------------------------------------------------------------
+void PostSetVolume(int volume) {
+    std::string body =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.SetVolume\","
+        "\"params\":{\"volume\":" + std::to_string(volume) + "}}";
+
+    HINTERNET hInet = InternetOpenA("DrmLauncher", INTERNET_OPEN_TYPE_DIRECT,
+                                     nullptr, nullptr, 0);
+    if (!hInet) {
+        AppendLogUtf8("[volume] InternetOpen failed\r\n");
+        return;
+    }
+
+    HINTERNET hConn = InternetConnectA(hInet, KODI_JSONRPC_HOST, (INTERNET_PORT)KODI_JSONRPC_PORT,
+                                        nullptr, nullptr, INTERNET_SERVICE_HTTP, 0, 0);
+    if (!hConn) {
+        AppendLogUtf8("[volume] could not connect to Kodi JSON-RPC\r\n");
+        InternetCloseHandle(hInet);
+        return;
+    }
+
+    HINTERNET hReq = HttpOpenRequestA(hConn, "POST", KODI_JSONRPC_PATH, nullptr, nullptr,
+                                       nullptr, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    if (!hReq) {
+        AppendLogUtf8("[volume] HttpOpenRequest failed\r\n");
+        InternetCloseHandle(hConn);
+        InternetCloseHandle(hInet);
+        return;
+    }
+
+    static const char* headers = "Content-Type: application/json\r\n";
+    BOOL ok = HttpSendRequestA(hReq, headers, (DWORD)strlen(headers),
+                                (LPVOID)body.data(), (DWORD)body.size());
+    if (!ok) {
+        AppendLogUtf8("[volume] Application.SetVolume request failed\r\n");
+    }
+
+    InternetCloseHandle(hReq);
+    InternetCloseHandle(hConn);
+    InternetCloseHandle(hInet);
+}
+
+// Runs PostSetVolume() on a worker thread so the slider never blocks the UI.
+void SetVolumeThread(int volume) {
+    PostSetVolume(volume);
+}
+
 void RunSshExec(const std::string& cmd) {
     const std::string host = SSH_HOST;
 
@@ -347,11 +412,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessageW(g_hKillBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
         y += 45;
 
+        // Ползунок громкости Kodi (Application.SetVolume через JSON-RPC),
+        // логика как в KodiGui (MainWindow::postSetVolume, ветка tab_match_vers2),
+        // см. PostSetVolume()/SetVolumeThread() выше.
+        mkLabel(L"Громкость Kodi:", 15, y, labelW, ID_STATIC_VOLUME);
+        g_hVolSlider = CreateWindowExW(0, TRACKBAR_CLASS, L"",
+            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
+            editX, y - 2, 260, 30, hwnd, (HMENU)(INT_PTR)ID_SLIDER_VOLUME, nullptr, nullptr);
+        SendMessageW(g_hVolSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
+        SendMessageW(g_hVolSlider, TBM_SETTICFREQ, 10, 0);
+        SendMessageW(g_hVolSlider, TBM_SETPOS, TRUE, 50);
+
+        g_hVolLabel = mkLabel(L"50%", editX + 270, y, 50, 0);
+        y += rowH;
+
+
         g_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
             15, y, editX + editW - 15, 260, hwnd, (HMENU)ID_EDIT_LOG, nullptr, nullptr);
         SendMessageW(g_hLog, WM_SETFONT, (WPARAM)hFont, TRUE);
 
+        return 0;
+    }
+
+    case WM_HSCROLL: {
+        if ((HWND)lParam == g_hVolSlider) {
+            int pos = (int)SendMessageW(g_hVolSlider, TBM_GETPOS, 0, 0);
+            SetWindowTextW(g_hVolLabel, (std::to_wstring(pos) + L"%").c_str());
+            std::thread(SetVolumeThread, pos).detach();
+        }
         return 0;
     }
 
@@ -391,7 +480,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"N_m3u8DL-RE — запуск по SSH (192.168.8.45)",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 620, 430,
+        CW_USEDEFAULT, CW_USEDEFAULT, 620, 470,
         nullptr, nullptr, hInstance, nullptr);
 
     ShowWindow(hwnd, nCmdShow);

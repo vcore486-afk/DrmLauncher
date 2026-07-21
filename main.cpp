@@ -70,14 +70,23 @@ enum ControlId {
     ID_BUTTON_STOP_PLAY,   // "Остановить плеер" — Kodi JSON-RPC Player.Stop
     ID_EDIT_LOG,
     ID_STATIC_ARG1,
-    ID_STATIC_ARG2
+    ID_STATIC_ARG2,
+    ID_SLIDER_VOLUME,      // Ползунок громкости — Kodi JSON-RPC Application.SetVolume
+    ID_STATIC_VOLUME,
+    ID_STATIC_VOLUME_VALUE
 };
 
 // ---------------------------------------------------------------------------
 // Глобальные хендлы
 // ---------------------------------------------------------------------------
 HWND g_hArg1, g_hArg2, g_hLog, g_hRunBtn, g_hKillBtn, g_hPlayBtn, g_hStopBtn;
-std::atomic<bool> g_running{false};
+HWND g_hVolumeSlider, g_hVolumeValueLabel;
+// Отдельные флаги "занятости": скачивание (Выполнить/Остановить) и плеер
+// (Воспроизвести/Остановить плеер/громкость) теперь независимы — запуск
+// скачивания больше не блокирует кнопки плеера.
+std::atomic<bool> g_running{false};      // занят процесс скачивания (Выполнить/Остановить)
+std::atomic<bool> g_playerBusy{false};   // занят Kodi-плеер (Воспроизвести/Остановить плеер)
+std::atomic<bool> g_volumeBusy{false};   // выполняется запрос смены громкости
 std::mutex g_logMutex;
 
 // ---------------------------------------------------------------------------
@@ -143,22 +152,18 @@ std::string ShellQuote(const std::string& s) {
 // Общее ядро для любой команды на сервере — используется и кнопкой "Выполнить",
 // и кнопкой "Остановить" (killall), чтобы не дублировать connect/auth/read-цикл.
 // ---------------------------------------------------------------------------
-void RunSshExec(const std::string& cmd) {
+void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, HWND btn2 = nullptr) {
     const std::string host = SSH_HOST;
 
-    g_running = true;
-    EnableWindow(g_hRunBtn, FALSE);
-    EnableWindow(g_hKillBtn, FALSE);
-    EnableWindow(g_hPlayBtn, FALSE);
-    EnableWindow(g_hStopBtn, FALSE);
+    busyFlag = true;
+    EnableWindow(btn1, FALSE);
+    if (btn2) EnableWindow(btn2, FALSE);
 
     auto fail = [&](const std::wstring& msg) {
         AppendLog(L"[ОШИБКА] " + msg + L"\r\n");
-        g_running = false;
-        EnableWindow(g_hRunBtn, TRUE);
-        EnableWindow(g_hKillBtn, TRUE);
-        EnableWindow(g_hPlayBtn, TRUE);
-        EnableWindow(g_hStopBtn, TRUE);
+        busyFlag = false;
+        EnableWindow(btn1, TRUE);
+        if (btn2) EnableWindow(btn2, TRUE);
     };
 
     WSADATA wsaData;
@@ -287,11 +292,9 @@ void RunSshExec(const std::string& cmd) {
     libssh2_exit();
     WSACleanup();
 
-    g_running = false;
-    EnableWindow(g_hRunBtn, TRUE);
-    EnableWindow(g_hKillBtn, TRUE);
-    EnableWindow(g_hPlayBtn, TRUE);
-    EnableWindow(g_hStopBtn, TRUE);
+    busyFlag = false;
+    EnableWindow(btn1, TRUE);
+    if (btn2) EnableWindow(btn2, TRUE);
 }
 
 // Поток кнопки "Выполнить" — собирает команду запуска N_m3u8DL-RE из аргументов
@@ -310,12 +313,12 @@ void RunSshCommandThread(std::wstring arg1W, std::wstring arg2W) {
         " -sv worst --save-name \"drm\" --save-dir \"$HOME\""
         " --live-pipe-mux --select-audio id=\"audio_aar=128000\"";
 
-    RunSshExec(cmd);
+    RunSshExec(cmd, g_running, g_hRunBtn, g_hKillBtn);
 }
 
 // Поток кнопки "Остановить" — принудительно убивает N_m3u8DL-RE на сервере.
 void KillCommandThread() {
-    RunSshExec("killall -9 N_m3u8DL-RE");
+    RunSshExec("killall -9 N_m3u8DL-RE", g_running, g_hRunBtn, g_hKillBtn);
 }
 
 // Кнопка "Воспроизвести": на сервере определяется, какой файл реально появился после N_m3u8DL-RE (drm.aar.ts, если аудио замьюксить в mp4 не удалось, иначе drm.ts), и через Kodi JSON-RPC (Player.Open) запускается его воспроизведение.
@@ -327,7 +330,7 @@ if [ ! -f "$FILE" ]; then FILE="$HOME/drm.ts"; fi
 if [ ! -f "$FILE" ]; then echo ')CMD") + std::string((const char*)"Файл drm.aar.ts или drm.ts не найден в $HOME на сервере") + R"CMD(' >&2; exit 1; fi
 curl -s -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"Player.Open","params":{"item":{"file":"'"$FILE"'"}}}' )CMD" + url;
 
-    RunSshExec(cmd);
+    RunSshExec(cmd, g_playerBusy, g_hPlayBtn, g_hStopBtn);
 }
 
 // Кнопка "Остановить плеер": Kodi JSON-RPC Player.Stop останавливает текущее воспроизведение (не трогая сам процесс N_m3u8DL-RE).
@@ -336,7 +339,20 @@ void StopPlayCommandThread() {
 
     std::string cmd = std::string(R"CMD(curl -s -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"Player.Stop","params":{"playerid":1}}' )CMD") + url;
 
-    RunSshExec(cmd);
+    RunSshExec(cmd, g_playerBusy, g_hPlayBtn, g_hStopBtn);
+}
+
+// Ползунок громкости: Kodi JSON-RPC Application.SetVolume (0-100), так же
+// через curl по SSH на самом Raspberry Pi, как и Play/Stop-плеер.
+void SetVolumeThread(int volume) {
+    std::string url = std::string("http://") + KODI_JSONRPC_HOST + ":" + std::to_string(KODI_JSONRPC_PORT) + "/jsonrpc";
+
+    std::string cmd =
+        "curl -s -X POST -H \"Content-Type: application/json\" -d "
+        "'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.SetVolume\",\"params\":{\"volume\":"
+        + std::to_string(volume) + "}}' " + url;
+
+    RunSshExec(cmd, g_volumeBusy, g_hVolumeSlider);
 }
 
 
@@ -392,6 +408,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             editX + 160, y, 150, 30, hwnd, (HMENU)ID_BUTTON_STOP_PLAY, nullptr, nullptr);
         SendMessageW(g_hStopBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+        y += 40;
+
+        mkLabel(L"Громкость плеера:", 15, y + 5, labelW, ID_STATIC_VOLUME);
+
+        g_hVolumeSlider = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
+            editX, y, editW - 60, 30, hwnd, (HMENU)ID_SLIDER_VOLUME, nullptr, nullptr);
+        SendMessageW(g_hVolumeSlider, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
+        SendMessageW(g_hVolumeSlider, TBM_SETTICFREQ, 10, 0);
+        SendMessageW(g_hVolumeSlider, TBM_SETPOS, TRUE, 50);
+
+        g_hVolumeValueLabel = CreateWindowW(L"STATIC", L"50%",
+            WS_CHILD | WS_VISIBLE | SS_RIGHT,
+            editX + editW - 50, y + 5, 50, 20, hwnd, (HMENU)ID_STATIC_VOLUME_VALUE, nullptr, nullptr);
+        SendMessageW(g_hVolumeValueLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
         y += 45;
 
         g_hLog = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -414,15 +445,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetWindowTextW(g_hLog, L"");
             std::thread(KillCommandThread).detach();
         }
-        else if (LOWORD(wParam) == ID_BUTTON_PLAY && !g_running) {
+        else if (LOWORD(wParam) == ID_BUTTON_PLAY && !g_playerBusy) {
             SetWindowTextW(g_hLog, L"");
             std::thread(PlayCommandThread).detach();
         }
-        else if (LOWORD(wParam) == ID_BUTTON_STOP_PLAY && !g_running) {
+        else if (LOWORD(wParam) == ID_BUTTON_STOP_PLAY && !g_playerBusy) {
             SetWindowTextW(g_hLog, L"");
             std::thread(StopPlayCommandThread).detach();
         }
         return 0;
+
+    case WM_HSCROLL: {
+        if ((HWND)lParam == g_hVolumeSlider) {
+            int pos = (int)SendMessageW(g_hVolumeSlider, TBM_GETPOS, 0, 0);
+            SetWindowTextW(g_hVolumeValueLabel, (std::to_wstring(pos) + L"%").c_str());
+
+            // Отправляем на Kodi не на каждое промежуточное событие перетаскивания
+            // (SB_THUMBTRACK), а только когда значение зафиксировано — это
+            // избавляет от лавины SSH-подключений при перетаскивании ползунка.
+            WORD code = LOWORD(wParam);
+            if (code != SB_THUMBTRACK && !g_volumeBusy) {
+                SetWindowTextW(g_hLog, L"");
+                std::thread(SetVolumeThread, pos).detach();
+            }
+        }
+        return 0;
+    }
 
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -446,7 +494,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"N_m3u8DL-RE — запуск по SSH (192.168.8.45)",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
-        CW_USEDEFAULT, CW_USEDEFAULT, 620, 470,
+        CW_USEDEFAULT, CW_USEDEFAULT, 620, 515,
         nullptr, nullptr, hInstance, nullptr);
 
     ShowWindow(hwnd, nCmdShow);

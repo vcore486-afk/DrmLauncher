@@ -9,10 +9,16 @@
 // UTF-16 <-> UTF-8 через WinAPI (Utf8ToWide / WideToUtf8).
 //
 // Сборка (MinGW):
-//   g++ -O2 -std=c++17 main.cpp -o DrmLauncher.exe -lssh2 -lws2_32 -mwindows -municode
+//   g++ -O2 -std=c++17 main.cpp -o DrmLauncher.exe -lssh2 -lws2_32 -lwinhttp -mwindows -municode
 //
 // Сборка (MSVC, из "x64 Native Tools Command Prompt"):
-//   cl /EHsc /utf-8 /std:c++17 main.cpp libssh2.lib ws2_32.lib user32.lib gdi32.lib /Fe:DrmLauncher.exe
+//   cl /EHsc /utf-8 /std:c++17 main.cpp libssh2.lib ws2_32.lib winhttp.lib user32.lib gdi32.lib /Fe:DrmLauncher.exe
+//
+// Изменение громкости (Application.SetVolume) теперь выполняется НЕ через SSH,
+// а прямым HTTP-запросом (WinHTTP) с Windows-клиента напрямую на Kodi JSON-RPC
+// на Raspberry Pi. Нужна библиотека winhttp.lib (часть Windows SDK, отдельно
+// ставить не нужно). Play/Stop-плеер и запуск/остановка загрузки по-прежнему
+// работают через SSH, как и раньше.
 // (флаг /utf-8 обязателен: файл сохранён в UTF-8, без него MSVC может
 //  неверно интерпретировать кириллицу в строковых литералах)
 //
@@ -34,6 +40,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <libssh2.h>
+#include <winhttp.h>
 
 #include <string>
 #include <thread>
@@ -43,6 +50,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 // ---------------------------------------------------------------------------
 // Константы подключения (заданы по условию задачи)
@@ -57,6 +65,12 @@ static const int   SSH_PORT = 22;
 // поэтому не зависит от того, доступен ли порт Kodi извне с Windows-клиента.
 static const char* KODI_JSONRPC_HOST = "127.0.0.1";
 static const int   KODI_JSONRPC_PORT = 8081;
+
+// Для громкости (Application.SetVolume) запрос идёт напрямую с Windows-клиента
+// по HTTP (WinHTTP), без SSH, поэтому нужен LAN-адрес Raspberry Pi, а не
+// 127.0.0.1. Порт Kodi JSON-RPC (8081) должен быть доступен на этом адресе
+// из локальной сети.
+static const char* KODI_JSONRPC_LAN_HOST = SSH_HOST;
 
 // ---------------------------------------------------------------------------
 // Идентификаторы элементов управления
@@ -145,6 +159,63 @@ std::string ShellQuote(const std::string& s) {
     }
     out += "'";
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Прямой HTTP POST к Kodi JSON-RPC через WinHTTP (без SSH и без внешнего curl.exe).
+// Используется только для смены громкости — остальные Kodi-команды (Play/Stop)
+// по-прежнему идут через SSH+curl на самом сервере, см. RunSshExec ниже.
+// ---------------------------------------------------------------------------
+bool KodiJsonRpcHttpPost(const std::string& host, int port, const std::string& jsonBody, std::wstring& outError) {
+    std::wstring hostW = Utf8ToWide(host);
+    bool ok = false;
+
+    HINTERNET hSession = WinHttpOpen(L"DrmLauncher/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        outError = L"WinHttpOpen не выполнен (код " + std::to_wstring(GetLastError()) + L")";
+        return false;
+    }
+
+    // Таймауты, чтобы зависший/недоступный Kodi не подвешивал поток надолго.
+    WinHttpSetTimeouts(hSession, 3000, 3000, 3000, 3000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, hostW.c_str(), (INTERNET_PORT)port, 0);
+    if (!hConnect) {
+        outError = L"WinHttpConnect не выполнен (код " + std::to_wstring(GetLastError()) + L")";
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/jsonrpc",
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) {
+        outError = L"WinHttpOpenRequest не выполнен (код " + std::to_wstring(GetLastError()) + L")";
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    const wchar_t* headers = L"Content-Type: application/json";
+    BOOL sent = WinHttpSendRequest(hRequest, headers, (DWORD)-1,
+        (LPVOID)jsonBody.data(), (DWORD)jsonBody.size(), (DWORD)jsonBody.size(), 0);
+
+    if (sent && WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD statusCode = 0, size = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &size, WINHTTP_NO_HEADER_INDEX);
+        ok = (statusCode >= 200 && statusCode < 300);
+        if (!ok) outError = L"Сервер вернул HTTP-статус " + std::to_wstring(statusCode);
+    } else {
+        outError = L"Не удалось отправить HTTP-запрос (код " + std::to_wstring(GetLastError()) + L")";
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -342,17 +413,32 @@ void StopPlayCommandThread() {
     RunSshExec(cmd, g_playerBusy, g_hPlayBtn, g_hStopBtn);
 }
 
-// Ползунок громкости: Kodi JSON-RPC Application.SetVolume (0-100), так же
-// через curl по SSH на самом Raspberry Pi, как и Play/Stop-плеер.
+// Ползунок громкости: Kodi JSON-RPC Application.SetVolume (0-100). В отличие
+// от Play/Stop-плеера, здесь SSH не используется — запрос уходит напрямую
+// с Windows-клиента на Kodi по HTTP (WinHTTP), это быстрее (не тратится время
+// на SSH-хендшейк и авторизацию на каждое движение ползунка).
 void SetVolumeThread(int volume) {
-    std::string url = std::string("http://") + KODI_JSONRPC_HOST + ":" + std::to_string(KODI_JSONRPC_PORT) + "/jsonrpc";
+    g_volumeBusy = true;
+    EnableWindow(g_hVolumeSlider, FALSE);
 
-    std::string cmd =
-        "curl -s -X POST -H \"Content-Type: application/json\" -d "
-        "'{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.SetVolume\",\"params\":{\"volume\":"
-        + std::to_string(volume) + "}}' " + url;
+    AppendLog(L"[ИНФО] Установка громкости: " + std::to_wstring(volume) +
+        L"% (прямой HTTP-запрос к Kodi JSON-RPC, без SSH)\r\n");
 
-    RunSshExec(cmd, g_volumeBusy, g_hVolumeSlider);
+    std::string jsonBody =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.SetVolume\",\"params\":{\"volume\":"
+        + std::to_string(volume) + "}}";
+
+    std::wstring err;
+    bool ok = KodiJsonRpcHttpPost(KODI_JSONRPC_LAN_HOST, KODI_JSONRPC_PORT, jsonBody, err);
+
+    if (ok) {
+        AppendLog(L"[ИНФО] Громкость установлена: " + std::to_wstring(volume) + L"%\r\n");
+    } else {
+        AppendLog(L"[ОШИБКА] " + err + L"\r\n");
+    }
+
+    g_volumeBusy = false;
+    EnableWindow(g_hVolumeSlider, TRUE);
 }
 
 

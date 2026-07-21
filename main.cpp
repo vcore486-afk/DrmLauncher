@@ -1,36 +1,36 @@
-// DrmLauncher - Win32 GUI для запуска N_m3u8DL-RE на удалённом сервере по SSH
+// DrmLauncher - Win32 GUI ��� ������� N_m3u8DL-RE �� �������� ������� �� SSH
 //
-// Использует libssh2 (exec-канал), как в KodiGui, вместо вызова внешнего ssh.exe.
+// ���������� libssh2 (exec-�����), ��� � KodiGui, ������ ������ �������� ssh.exe.
 //
-// Юникодная (UTF-16) версия: все окна/контролы созданы через *W API, текст в
-// элементах управления хранится как std::wstring. Поскольку SSH-команда и вывод
-// удалённого процесса — это байты в кодировке UTF-8 (стандарт для POSIX shell
-// и Linux/*BSD консоли), на границе "GUI <-> SSH" сделана явная конвертация
-// UTF-16 <-> UTF-8 через WinAPI (Utf8ToWide / WideToUtf8).
+// ��������� (UTF-16) ������: ��� ����/�������� ������� ����� *W API, ����� �
+// ��������� ���������� �������� ��� std::wstring. ��������� SSH-������� � �����
+// ��������� �������� � ��� ����� � ��������� UTF-8 (�������� ��� POSIX shell
+// � Linux/*BSD �������), �� ������� "GUI <-> SSH" ������� ����� �����������
+// UTF-16 <-> UTF-8 ����� WinAPI (Utf8ToWide / WideToUtf8).
 //
-// Сборка (MinGW):
+// ������ (MinGW):
 //   g++ -O2 -std=c++17 main.cpp -o DrmLauncher.exe -lssh2 -lws2_32 -lwinhttp -mwindows -municode
 //
-// Сборка (MSVC, из "x64 Native Tools Command Prompt"):
+// ������ (MSVC, �� "x64 Native Tools Command Prompt"):
 //   cl /EHsc /utf-8 /std:c++17 main.cpp libssh2.lib ws2_32.lib winhttp.lib user32.lib gdi32.lib /Fe:DrmLauncher.exe
 //
-// Изменение громкости (Application.SetVolume) теперь выполняется НЕ через SSH,
-// а прямым HTTP-запросом (WinHTTP) с Windows-клиента напрямую на Kodi JSON-RPC
-// на Raspberry Pi. Нужна библиотека winhttp.lib (часть Windows SDK, отдельно
-// ставить не нужно). Play/Stop-плеер и запуск/остановка загрузки по-прежнему
-// работают через SSH, как и раньше.
-// (флаг /utf-8 обязателен: файл сохранён в UTF-8, без него MSVC может
-//  неверно интерпретировать кириллицу в строковых литералах)
+// ��������� ��������� (Application.SetVolume) ������ ����������� �� ����� SSH,
+// � ������ HTTP-�������� (WinHTTP) � Windows-������� �������� �� Kodi JSON-RPC
+// �� Raspberry Pi. ����� ���������� winhttp.lib (����� Windows SDK, ��������
+// ������� �� �����). Play/Stop-����� � ������/��������� �������� ��-��������
+// �������� ����� SSH, ��� � ������.
+// (���� /utf-8 ����������: ���� �������� � UTF-8, ��� ���� MSVC �����
+//  ������� ���������������� ��������� � ��������� ���������)
 //
-// Важно: точка входа теперь wWinMain (юникодная), поэтому для MinGW обязателен
-// флаг линковки -municode — иначе будет ошибка "undefined reference to WinMain"
-// (линкер по умолчанию ищет WinMainCRTStartup, а не wWinMainCRTStartup).
-// Для MSVC ничего дополнительно указывать не нужно — компилятор сам подставит
-// нужный CRT-стартап под сигнатуру wWinMain.
+// �����: ����� ����� ������ wWinMain (���������), ������� ��� MinGW ����������
+// ���� �������� -municode � ����� ����� ������ "undefined reference to WinMain"
+// (������ �� ��������� ���� WinMainCRTStartup, � �� wWinMainCRTStartup).
+// ��� MSVC ������ ������������� ��������� �� ����� � ���������� ��� ���������
+// ������ CRT-������� ��� ��������� wWinMain.
 //
-// Нужна библиотека libssh2 (заголовки + .lib/.a). Проще всего поставить через vcpkg:
+// ����� ���������� libssh2 (��������� + .lib/.a). ����� ����� ��������� ����� vcpkg:
 //   vcpkg install libssh2:x64-windows
-// и указать компилятору include/lib пути vcpkg (см. README.txt рядом).
+// � ������� ����������� include/lib ���� vcpkg (��. README.txt �����).
 
 #define WIN32_LEAN_AND_MEAN
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
@@ -53,59 +53,59 @@
 #pragma comment(lib, "winhttp.lib")
 
 // ---------------------------------------------------------------------------
-// Константы подключения (заданы по условию задачи)
+// ��������� ����������� (������ �� ������� ������)
 // ---------------------------------------------------------------------------
 static const char* SSH_HOST = "192.168.8.45";
 static const char* SSH_USER = "pi";
 static const char* SSH_PASS = "639639";
 static const int   SSH_PORT = 22;
 
-// Kodi JSON-RPC (для кнопок "Воспроизвести" / "Остановить плеер").
-// Запрос выполняется через SSH командой curl на самом Raspberry Pi (127.0.0.1),
-// поэтому не зависит от того, доступен ли порт Kodi извне с Windows-клиента.
+// Kodi JSON-RPC (��� ������ "�������������" / "���������� �����").
+// ������ ����������� ����� SSH �������� curl �� ����� Raspberry Pi (127.0.0.1),
+// ������� �� ������� �� ����, �������� �� ���� Kodi ����� � Windows-�������.
 static const char* KODI_JSONRPC_HOST = "127.0.0.1";
 static const int   KODI_JSONRPC_PORT = 8081;
 
-// Для громкости (Application.SetVolume) запрос идёт напрямую с Windows-клиента
-// по HTTP (WinHTTP), без SSH, поэтому нужен LAN-адрес Raspberry Pi, а не
-// 127.0.0.1. Порт Kodi JSON-RPC (8081) должен быть доступен на этом адресе
-// из локальной сети.
+// ��� ��������� (Application.SetVolume) ������ ��� �������� � Windows-�������
+// �� HTTP (WinHTTP), ��� SSH, ������� ����� LAN-����� Raspberry Pi, � ��
+// 127.0.0.1. ���� Kodi JSON-RPC (8081) ������ ���� �������� �� ���� ������
+// �� ��������� ����.
 static const char* KODI_JSONRPC_LAN_HOST = SSH_HOST;
 
 // ---------------------------------------------------------------------------
-// Идентификаторы элементов управления
+// �������������� ��������� ����������
 // ---------------------------------------------------------------------------
 enum ControlId {
-    ID_EDIT_ARG1 = 1001,   // $1  (например, ссылка на m3u8 / манифест)
-    ID_EDIT_ARG2,          // $2  (ключ DRM)
+    ID_EDIT_ARG1 = 1001,   // $1  (��������, ������ �� m3u8 / ��������)
+    ID_EDIT_ARG2,          // $2  (���� DRM)
     ID_BUTTON_RUN,
-    ID_BUTTON_KILL,        // "Остановить" — killall -9 N_m3u8DL-RE на сервере
-    ID_BUTTON_PLAY,        // "Воспроизвести" — Kodi JSON-RPC Player.Open (drm.aar.ts / drm.ts)
-    ID_BUTTON_STOP_PLAY,   // "Остановить плеер" — Kodi JSON-RPC Player.Stop
+    ID_BUTTON_KILL,        // "����������" � killall -9 N_m3u8DL-RE �� �������
+    ID_BUTTON_PLAY,        // "�������������" � Kodi JSON-RPC Player.Open (drm.aar.ts / drm.ts)
+    ID_BUTTON_STOP_PLAY,   // "���������� �����" � Kodi JSON-RPC Player.Stop
     ID_EDIT_LOG,
     ID_STATIC_ARG1,
     ID_STATIC_ARG2,
-    ID_SLIDER_VOLUME,      // Ползунок громкости — Kodi JSON-RPC Application.SetVolume
+    ID_SLIDER_VOLUME,      // �������� ��������� � Kodi JSON-RPC Application.SetVolume
     ID_STATIC_VOLUME,
     ID_STATIC_VOLUME_VALUE
 };
 
 // ---------------------------------------------------------------------------
-// Глобальные хендлы
+// ���������� ������
 // ---------------------------------------------------------------------------
 HWND g_hArg1, g_hArg2, g_hLog, g_hRunBtn, g_hKillBtn, g_hPlayBtn, g_hStopBtn;
 HWND g_hVolumeSlider, g_hVolumeValueLabel;
-// Отдельные флаги "занятости": скачивание (Выполнить/Остановить) и плеер
-// (Воспроизвести/Остановить плеер/громкость) теперь независимы — запуск
-// скачивания больше не блокирует кнопки плеера.
-std::atomic<bool> g_running{false};      // занят процесс скачивания (Выполнить/Остановить)
-std::atomic<bool> g_playerBusy{false};   // занят Kodi-плеер (Воспроизвести/Остановить плеер)
-std::atomic<bool> g_volumeBusy{false};   // выполняется запрос смены громкости
+// ��������� ����� "���������": ���������� (���������/����������) � �����
+// (�������������/���������� �����/���������) ������ ���������� � ������
+// ���������� ������ �� ��������� ������ ������.
+std::atomic<bool> g_running{false};      // ����� ������� ���������� (���������/����������)
+std::atomic<bool> g_playerBusy{false};   // ����� Kodi-����� (�������������/���������� �����)
+std::atomic<bool> g_volumeBusy{false};   // ����������� ������ ����� ���������
 std::mutex g_logMutex;
 
 // ---------------------------------------------------------------------------
-// Конвертация UTF-8 <-> UTF-16 (WinAPI). SSH-команда и вывод удалённого шелла —
-// UTF-8; нативные Win32 *W контролы — UTF-16.
+// ����������� UTF-8 <-> UTF-16 (WinAPI). SSH-������� � ����� ��������� ����� �
+// UTF-8; �������� Win32 *W �������� � UTF-16.
 // ---------------------------------------------------------------------------
 std::wstring Utf8ToWide(const std::string& s) {
     if (s.empty()) return std::wstring();
@@ -123,7 +123,7 @@ std::string WideToUtf8(const std::wstring& s) {
     return out;
 }
 
-// Потокобезопасный вывод в лог (лог многострочный edit control)
+// ���������������� ����� � ��� (��� ������������� edit control)
 void AppendLog(const std::wstring& text) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     int len = GetWindowTextLengthW(g_hLog);
@@ -131,13 +131,13 @@ void AppendLog(const std::wstring& text) {
     SendMessageW(g_hLog, EM_REPLACESEL, FALSE, (LPARAM)text.c_str());
 }
 
-// Перегрузка для удобства логирования байтов, пришедших с удалённого хоста
-// в UTF-8 (stdout/stderr процесса на Linux/*BSD).
+// ���������� ��� �������� ����������� ������, ��������� � ��������� �����
+// � UTF-8 (stdout/stderr �������� �� Linux/*BSD).
 void AppendLogUtf8(const std::string& utf8text) {
     AppendLog(Utf8ToWide(utf8text));
 }
 
-// Достаём текст из edit control в std::wstring
+// ������ ����� �� edit control � std::wstring
 std::wstring GetEditText(HWND h) {
     int len = GetWindowTextLengthW(h);
     std::vector<wchar_t> buf(len + 1);
@@ -146,10 +146,10 @@ std::wstring GetEditText(HWND h) {
 }
 
 // ---------------------------------------------------------------------------
-// Экранирование значения для одиночных кавычек в POSIX shell:  it's -> 'it'"'"'s'
-// Работает с UTF-8 байтами: одинарная кавычка (0x27) не может встретиться
-// как байт продолжения многобайтовой UTF-8 последовательности, поэтому
-// побайтовый разбор безопасен.
+// ������������� �������� ��� ��������� ������� � POSIX shell:  it's -> 'it'"'"'s'
+// �������� � UTF-8 �������: ��������� ������� (0x27) �� ����� �����������
+// ��� ���� ����������� ������������� UTF-8 ������������������, �������
+// ���������� ������ ���������.
 // ---------------------------------------------------------------------------
 std::string ShellQuote(const std::string& s) {
     std::string out = "'";
@@ -162,9 +162,9 @@ std::string ShellQuote(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
-// Прямой HTTP POST к Kodi JSON-RPC через WinHTTP (без SSH и без внешнего curl.exe).
-// Используется только для смены громкости — остальные Kodi-команды (Play/Stop)
-// по-прежнему идут через SSH+curl на самом сервере, см. RunSshExec ниже.
+// ������ HTTP POST � Kodi JSON-RPC ����� WinHTTP (��� SSH � ��� �������� curl.exe).
+// ������������ ������ ��� ����� ��������� � ��������� Kodi-������� (Play/Stop)
+// ��-�������� ���� ����� SSH+curl �� ����� �������, ��. RunSshExec ����.
 // ---------------------------------------------------------------------------
 bool KodiJsonRpcHttpPost(const std::string& host, int port, const std::string& jsonBody, std::wstring& outError) {
     std::wstring hostW = Utf8ToWide(host);
@@ -174,16 +174,16 @@ bool KodiJsonRpcHttpPost(const std::string& host, int port, const std::string& j
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
-        outError = L"WinHttpOpen не выполнен (код " + std::to_wstring(GetLastError()) + L")";
+        outError = L"WinHttpOpen �� �������� (��� " + std::to_wstring(GetLastError()) + L")";
         return false;
     }
 
-    // Таймауты, чтобы зависший/недоступный Kodi не подвешивал поток надолго.
+    // ��������, ����� ��������/����������� Kodi �� ���������� ����� �������.
     WinHttpSetTimeouts(hSession, 3000, 3000, 3000, 3000);
 
     HINTERNET hConnect = WinHttpConnect(hSession, hostW.c_str(), (INTERNET_PORT)port, 0);
     if (!hConnect) {
-        outError = L"WinHttpConnect не выполнен (код " + std::to_wstring(GetLastError()) + L")";
+        outError = L"WinHttpConnect �� �������� (��� " + std::to_wstring(GetLastError()) + L")";
         WinHttpCloseHandle(hSession);
         return false;
     }
@@ -191,7 +191,7 @@ bool KodiJsonRpcHttpPost(const std::string& host, int port, const std::string& j
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/jsonrpc",
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (!hRequest) {
-        outError = L"WinHttpOpenRequest не выполнен (код " + std::to_wstring(GetLastError()) + L")";
+        outError = L"WinHttpOpenRequest �� �������� (��� " + std::to_wstring(GetLastError()) + L")";
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
         return false;
@@ -207,9 +207,9 @@ bool KodiJsonRpcHttpPost(const std::string& host, int port, const std::string& j
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &size, WINHTTP_NO_HEADER_INDEX);
         ok = (statusCode >= 200 && statusCode < 300);
-        if (!ok) outError = L"Сервер вернул HTTP-статус " + std::to_wstring(statusCode);
+        if (!ok) outError = L"������ ������ HTTP-������ " + std::to_wstring(statusCode);
     } else {
-        outError = L"Не удалось отправить HTTP-запрос (код " + std::to_wstring(GetLastError()) + L")";
+        outError = L"�� ������� ��������� HTTP-������ (��� " + std::to_wstring(GetLastError()) + L")";
     }
 
     WinHttpCloseHandle(hRequest);
@@ -218,10 +218,18 @@ bool KodiJsonRpcHttpPost(const std::string& host, int port, const std::string& j
     return ok;
 }
 
+// ���� � ���� DRM-����� ������� �������� ���� "��������1:��������2", ���������
+// ��������2 (��, ��� ��� ����� ':'). ���� ':' � ������ ���, ���������� ������ ��� ����.
+std::string ExtractKeyAfterColon(const std::string& s) {
+    size_t pos = s.find(':');
+    if (pos == std::string::npos) return s;
+    return s.substr(pos + 1);
+}
+
 // ---------------------------------------------------------------------------
-// Собственно работа с SSH: подключение, аутентификация по паролю, exec, стрим вывода.
-// Общее ядро для любой команды на сервере — используется и кнопкой "Выполнить",
-// и кнопкой "Остановить" (killall), чтобы не дублировать connect/auth/read-цикл.
+// ���������� ������ � SSH: �����������, �������������� �� ������, exec, ����� ������.
+// ����� ���� ��� ����� ������� �� ������� � ������������ � ������� "���������",
+// � ������� "����������" (killall), ����� �� ����������� connect/auth/read-����.
 // ---------------------------------------------------------------------------
 void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, HWND btn2 = nullptr) {
     const std::string host = SSH_HOST;
@@ -231,7 +239,7 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
     if (btn2) EnableWindow(btn2, FALSE);
 
     auto fail = [&](const std::wstring& msg) {
-        AppendLog(L"[ОШИБКА] " + msg + L"\r\n");
+        AppendLog(L"[������] " + msg + L"\r\n");
         busyFlag = false;
         EnableWindow(btn1, TRUE);
         if (btn2) EnableWindow(btn2, TRUE);
@@ -239,13 +247,13 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        fail(L"WSAStartup не выполнен");
+        fail(L"WSAStartup �� ��������");
         return;
     }
 
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
-        fail(L"Не удалось создать сокет");
+        fail(L"�� ������� ������� �����");
         WSACleanup();
         return;
     }
@@ -255,14 +263,14 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
     hints.ai_socktype = SOCK_STREAM;
     std::string portStr = std::to_string(SSH_PORT);
     if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
-        fail(L"Не удалось разрешить адрес сервера: " + Utf8ToWide(host));
+        fail(L"�� ������� ��������� ����� �������: " + Utf8ToWide(host));
         closesocket(sock);
         WSACleanup();
         return;
     }
 
     if (connect(sock, res->ai_addr, (int)res->ai_addrlen) != 0) {
-        fail(L"Не удалось подключиться к " + Utf8ToWide(host) + L":" + Utf8ToWide(portStr));
+        fail(L"�� ������� ������������ � " + Utf8ToWide(host) + L":" + Utf8ToWide(portStr));
         freeaddrinfo(res);
         closesocket(sock);
         WSACleanup();
@@ -271,7 +279,7 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
     freeaddrinfo(res);
 
     if (libssh2_init(0) != 0) {
-        fail(L"libssh2_init не выполнен");
+        fail(L"libssh2_init �� ��������");
         closesocket(sock);
         WSACleanup();
         return;
@@ -279,7 +287,7 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
 
     LIBSSH2_SESSION* session = libssh2_session_init();
     if (!session) {
-        fail(L"Не удалось создать SSH-сессию");
+        fail(L"�� ������� ������� SSH-������");
         closesocket(sock);
         WSACleanup();
         return;
@@ -288,20 +296,20 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
     libssh2_session_set_blocking(session, 1);
 
     if (libssh2_session_handshake(session, sock) != 0) {
-        fail(L"SSH handshake не выполнен");
+        fail(L"SSH handshake �� ��������");
         libssh2_session_free(session);
         closesocket(sock);
         WSACleanup();
         return;
     }
 
-    AppendLog(L"[ИНФО] Соединение установлено, авторизация...\r\n");
+    AppendLog(L"[����] ���������� �����������, �����������...\r\n");
 
     if (libssh2_userauth_password(session, SSH_USER, SSH_PASS) != 0) {
         char* errmsg = nullptr;
         int errlen = 0;
         libssh2_session_last_error(session, &errmsg, &errlen, 0);
-        fail(L"Ошибка авторизации: " + Utf8ToWide(errmsg ? errmsg : "неизвестно"));
+        fail(L"������ �����������: " + Utf8ToWide(errmsg ? errmsg : "����������"));
         libssh2_session_disconnect(session, "auth failed");
         libssh2_session_free(session);
         closesocket(sock);
@@ -311,7 +319,7 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
 
     LIBSSH2_CHANNEL* channel = libssh2_channel_open_session(session);
     if (!channel) {
-        fail(L"Не удалось открыть канал");
+        fail(L"�� ������� ������� �����");
         libssh2_session_disconnect(session, "channel failed");
         libssh2_session_free(session);
         closesocket(sock);
@@ -319,10 +327,10 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
         return;
     }
 
-    AppendLog(L"[ИНФО] Выполняется команда:\r\n" + Utf8ToWide(cmd) + L"\r\n\r\n");
+    AppendLog(L"[����] ����������� �������:\r\n" + Utf8ToWide(cmd) + L"\r\n\r\n");
 
     if (libssh2_channel_exec(channel, cmd.c_str()) != 0) {
-        fail(L"Не удалось выполнить команду на сервере");
+        fail(L"�� ������� ��������� ������� �� �������");
         libssh2_channel_free(channel);
         libssh2_session_disconnect(session, "exec failed");
         libssh2_session_free(session);
@@ -331,8 +339,8 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
         return;
     }
 
-    // Читаем stdout и stderr удалённого процесса (байты в UTF-8) и стримим в лог,
-    // конвертируя в UTF-16 для отображения в EDIT-контроле.
+    // ������ stdout � stderr ��������� �������� (����� � UTF-8) � ������� � ���,
+    // ����������� � UTF-16 ��� ����������� � EDIT-��������.
     char buf[4096];
     ssize_t n;
     for (;;) {
@@ -353,7 +361,7 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
     }
 
     int exitCode = libssh2_channel_get_exit_status(channel);
-    AppendLog(L"\r\n[ИНФО] Процесс завершён, код возврата: " + std::to_wstring(exitCode) + L"\r\n");
+    AppendLog(L"\r\n[����] ������� ��������, ��� ��������: " + std::to_wstring(exitCode) + L"\r\n");
 
     libssh2_channel_close(channel);
     libssh2_channel_free(channel);
@@ -368,13 +376,14 @@ void RunSshExec(const std::string& cmd, std::atomic<bool>& busyFlag, HWND btn1, 
     if (btn2) EnableWindow(btn2, TRUE);
 }
 
-// Поток кнопки "Выполнить" — собирает команду запуска N_m3u8DL-RE из аргументов
-// и передаёт её в общее ядро RunSshExec.
+// ����� ������ "���������" � �������� ������� ������� N_m3u8DL-RE �� ����������
+// � ������� � � ����� ���� RunSshExec.
 void RunSshCommandThread(std::wstring arg1W, std::wstring arg2W) {
     const std::string arg1 = WideToUtf8(arg1W);
-    const std::string arg2 = WideToUtf8(arg2W);
+    std::string arg2 = WideToUtf8(arg2W);
+    arg2 = ExtractKeyAfterColon(arg2); // ���� ������ �������� ����� ':' (��� ���� DRM)
 
-    // Формируем команду:
+    // ��������� �������:
     // N_m3u8DL-RE $1 -M format=mp4 --key $2 -sv worst --save-name "drm"
     //   --save-dir $HOME --live-pipe-mux --select-audio id="audio_aar=128000"
     std::string cmd =
@@ -387,24 +396,24 @@ void RunSshCommandThread(std::wstring arg1W, std::wstring arg2W) {
     RunSshExec(cmd, g_running, g_hRunBtn, g_hKillBtn);
 }
 
-// Поток кнопки "Остановить" — принудительно убивает N_m3u8DL-RE на сервере.
+// ����� ������ "����������" � ������������� ������� N_m3u8DL-RE �� �������.
 void KillCommandThread() {
     RunSshExec("killall -9 N_m3u8DL-RE", g_running, g_hRunBtn, g_hKillBtn);
 }
 
-// Кнопка "Воспроизвести": на сервере определяется, какой файл реально появился после N_m3u8DL-RE (drm.aar.ts, если аудио замьюксить в mp4 не удалось, иначе drm.ts), и через Kodi JSON-RPC (Player.Open) запускается его воспроизведение.
+// ������ "�������������": �� ������� ������������, ����� ���� ������� �������� ����� N_m3u8DL-RE (drm.aar.ts, ���� ����� ���������� � mp4 �� �������, ����� drm.ts), � ����� Kodi JSON-RPC (Player.Open) ����������� ��� ���������������.
 void PlayCommandThread() {
     std::string url = std::string("http://") + KODI_JSONRPC_HOST + ":" + std::to_string(KODI_JSONRPC_PORT) + "/jsonrpc";
 
     std::string cmd = std::string(R"CMD(FILE="$HOME/drm.aar.ts"
 if [ ! -f "$FILE" ]; then FILE="$HOME/drm.ts"; fi
-if [ ! -f "$FILE" ]; then echo ')CMD") + std::string((const char*)"Файл drm.aar.ts или drm.ts не найден в $HOME на сервере") + R"CMD(' >&2; exit 1; fi
+if [ ! -f "$FILE" ]; then echo ')CMD") + std::string((const char*)"���� drm.aar.ts ��� drm.ts �� ������ � $HOME �� �������") + R"CMD(' >&2; exit 1; fi
 curl -s -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"Player.Open","params":{"item":{"file":"'"$FILE"'"}}}' )CMD" + url;
 
     RunSshExec(cmd, g_playerBusy, g_hPlayBtn, g_hStopBtn);
 }
 
-// Кнопка "Остановить плеер": Kodi JSON-RPC Player.Stop останавливает текущее воспроизведение (не трогая сам процесс N_m3u8DL-RE).
+// ������ "���������� �����": Kodi JSON-RPC Player.Stop ������������� ������� ��������������� (�� ������ ��� ������� N_m3u8DL-RE).
 void StopPlayCommandThread() {
     std::string url = std::string("http://") + KODI_JSONRPC_HOST + ":" + std::to_string(KODI_JSONRPC_PORT) + "/jsonrpc";
 
@@ -413,16 +422,16 @@ void StopPlayCommandThread() {
     RunSshExec(cmd, g_playerBusy, g_hPlayBtn, g_hStopBtn);
 }
 
-// Ползунок громкости: Kodi JSON-RPC Application.SetVolume (0-100). В отличие
-// от Play/Stop-плеера, здесь SSH не используется — запрос уходит напрямую
-// с Windows-клиента на Kodi по HTTP (WinHTTP), это быстрее (не тратится время
-// на SSH-хендшейк и авторизацию на каждое движение ползунка).
+// �������� ���������: Kodi JSON-RPC Application.SetVolume (0-100). � �������
+// �� Play/Stop-������, ����� SSH �� ������������ � ������ ������ ��������
+// � Windows-������� �� Kodi �� HTTP (WinHTTP), ��� ������� (�� �������� �����
+// �� SSH-�������� � ����������� �� ������ �������� ��������).
 void SetVolumeThread(int volume) {
     g_volumeBusy = true;
     EnableWindow(g_hVolumeSlider, FALSE);
 
-    AppendLog(L"[ИНФО] Установка громкости: " + std::to_wstring(volume) +
-        L"% (прямой HTTP-запрос к Kodi JSON-RPC, без SSH)\r\n");
+    AppendLog(L"[����] ��������� ���������: " + std::to_wstring(volume) +
+        L"% (������ HTTP-������ � Kodi JSON-RPC, ��� SSH)\r\n");
 
     std::string jsonBody =
         "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Application.SetVolume\",\"params\":{\"volume\":"
@@ -432,9 +441,9 @@ void SetVolumeThread(int volume) {
     bool ok = KodiJsonRpcHttpPost(KODI_JSONRPC_LAN_HOST, KODI_JSONRPC_PORT, jsonBody, err);
 
     if (ok) {
-        AppendLog(L"[ИНФО] Громкость установлена: " + std::to_wstring(volume) + L"%\r\n");
+        AppendLog(L"[����] ��������� �����������: " + std::to_wstring(volume) + L"%\r\n");
     } else {
-        AppendLog(L"[ОШИБКА] " + err + L"\r\n");
+        AppendLog(L"[������] " + err + L"\r\n");
     }
 
     g_volumeBusy = false;
@@ -443,7 +452,7 @@ void SetVolumeThread(int volume) {
 
 
 // ---------------------------------------------------------------------------
-// Обработчик окна
+// ���������� ����
 // ---------------------------------------------------------------------------
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -466,37 +475,37 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         int labelW = 150, editX = 170, editW = 400, y = 15, rowH = 34;
 
-        mkLabel(L"Аргумент $1 (URL/манифест):", 15, y, labelW, ID_STATIC_ARG1);
+        mkLabel(L"�������� $1 (URL/��������):", 15, y, labelW, ID_STATIC_ARG1);
         g_hArg1 = mkEdit(editX, y - 2, editW, ID_EDIT_ARG1);
         y += rowH;
 
-        mkLabel(L"Аргумент $2 (ключ DRM):", 15, y, labelW, ID_STATIC_ARG2);
+        mkLabel(L"�������� $2 (���� DRM):", 15, y, labelW, ID_STATIC_ARG2);
         g_hArg2 = mkEdit(editX, y - 2, editW, ID_EDIT_ARG2);
         y += rowH;
 
-        g_hRunBtn = CreateWindowW(L"BUTTON", L"Выполнить",
+        g_hRunBtn = CreateWindowW(L"BUTTON", L"���������",
             WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
             editX, y, 150, 30, hwnd, (HMENU)ID_BUTTON_RUN, nullptr, nullptr);
         SendMessageW(g_hRunBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-        g_hKillBtn = CreateWindowW(L"BUTTON", L"Остановить",
+        g_hKillBtn = CreateWindowW(L"BUTTON", L"����������",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             editX + 160, y, 150, 30, hwnd, (HMENU)ID_BUTTON_KILL, nullptr, nullptr);
         SendMessageW(g_hKillBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
         y += 40;
 
-        g_hPlayBtn = CreateWindowW(L"BUTTON", L"Воспроизвести",
+        g_hPlayBtn = CreateWindowW(L"BUTTON", L"�������������",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             editX, y, 150, 30, hwnd, (HMENU)ID_BUTTON_PLAY, nullptr, nullptr);
         SendMessageW(g_hPlayBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-        g_hStopBtn = CreateWindowW(L"BUTTON", L"Остановить плеер",
+        g_hStopBtn = CreateWindowW(L"BUTTON", L"���������� �����",
             WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             editX + 160, y, 150, 30, hwnd, (HMENU)ID_BUTTON_STOP_PLAY, nullptr, nullptr);
         SendMessageW(g_hStopBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
         y += 40;
 
-        mkLabel(L"Громкость плеера:", 15, y + 5, labelW, ID_STATIC_VOLUME);
+        mkLabel(L"��������� ������:", 15, y + 5, labelW, ID_STATIC_VOLUME);
 
         g_hVolumeSlider = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
             WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
@@ -546,9 +555,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int pos = (int)SendMessageW(g_hVolumeSlider, TBM_GETPOS, 0, 0);
             SetWindowTextW(g_hVolumeValueLabel, (std::to_wstring(pos) + L"%").c_str());
 
-            // Отправляем на Kodi не на каждое промежуточное событие перетаскивания
-            // (SB_THUMBTRACK), а только когда значение зафиксировано — это
-            // избавляет от лавины SSH-подключений при перетаскивании ползунка.
+            // ���������� �� Kodi �� �� ������ ������������� ������� ��������������
+            // (SB_THUMBTRACK), � ������ ����� �������� ������������� � ���
+            // ��������� �� ������ SSH-����������� ��� �������������� ��������.
             WORD code = LOWORD(wParam);
             if (code != SB_THUMBTRACK && !g_volumeBusy) {
                 SetWindowTextW(g_hLog, L"");
@@ -578,7 +587,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"N_m3u8DL-RE — запуск по SSH (192.168.8.45)",
+    HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"N_m3u8DL-RE � ������ �� SSH (192.168.8.45)",
         WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 620, 515,
         nullptr, nullptr, hInstance, nullptr);
